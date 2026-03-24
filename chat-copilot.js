@@ -73,6 +73,7 @@ const ensureCopilotAgentTrigger = async () => {
         skills: [
           { skill_type: "Database design" },
           { skill_type: "Generate Page" },
+          { skill_type: "Metadata Query" },
         ],
       },
     });
@@ -386,25 +387,76 @@ const actionClasses = [
   require("./actions/generate-view"),
 ];
 
-const classesWithSkills = () => {
+const getExchangeSkills = () => {
   const state = getState();
-  const skills = state.copilot_skills || [];
+  const exchangeSkills = state.exchange?.agent_skills || [];
+  return exchangeSkills.filter((s) => s && s.skill_name);
+};
+
+const classesWithSkills = () => {
+  const skills = getExchangeSkills();
   return [...actionClasses, ...skills];
+};
+
+const findToolByName = (name) => {
+  for (const SkillClass of classesWithSkills()) {
+    if (SkillClass.function_name === name) {
+      return { tool: null, skill: SkillClass };
+    }
+    const skillInstance = new SkillClass({});
+    if (typeof skillInstance.provideTools === "function") {
+      const skillTools = skillInstance.provideTools();
+      const tools = Array.isArray(skillTools) ? skillTools : [skillTools];
+      const found = tools.find((t) => t?.function?.name === name);
+      if (found) {
+        return { tool: found, skill: skillInstance };
+      }
+    }
+  }
+  return null;
 };
 
 const getCompletionArguments = async () => {
   const tools = [];
   const sysPrompts = [];
-  for (const actionClass of classesWithSkills()) {
-    tools.push({
-      type: "function",
-      function: {
-        name: actionClass.function_name,
-        description: actionClass.description,
-        parameters: await actionClass.json_schema(),
-      },
-    });
-    sysPrompts.push(await actionClass.system_prompt());
+  const allSkillClasses = classesWithSkills();
+  for (const SkillClass of allSkillClasses) {
+    const skillName = SkillClass.skill_name || SkillClass.function_name || 'unknown';
+    const hasFunctionName = !!SkillClass.function_name;
+    
+    try {
+      const skillInstance = new SkillClass({});
+      const hasProvideTools = typeof skillInstance.provideTools === "function";
+      
+      if (hasProvideTools) {
+        const skillTools = skillInstance.provideTools();
+        if (Array.isArray(skillTools)) {
+          for (const tool of skillTools) {
+            if (tool?.function?.name && tool?.function?.parameters) {
+              tools.push(tool);
+            }
+          }
+        } else if (skillTools?.function?.name) {
+          tools.push(skillTools);
+        }
+        if (skillInstance.systemPrompt) {
+          const sp = await skillInstance.systemPrompt({});
+          if (sp) sysPrompts.push(sp);
+        }
+      } else if (hasFunctionName) {
+        tools.push({
+          type: "function",
+          function: {
+            name: SkillClass.function_name,
+            description: SkillClass.description,
+            parameters: await SkillClass.json_schema(),
+          },
+        });
+        sysPrompts.push(await SkillClass.system_prompt());
+      }
+    } catch (e) {
+      // skip skill on error
+    }
   }
   const systemPrompt =
     "You are building application components in a database application builder called Saltcorn.\n\n" +
@@ -424,25 +476,30 @@ const executeLegacy = async (table_id, viewname, config, body, { req }) => {
   const run = await WorkflowRun.findOne({ id: +run_id });
 
   const fcall = run.context.funcalls[fcall_id];
-  const actionClass = classesWithSkills().find(
-    (ac) => ac.function_name === (fcall.name || fcall.toolName)
-  );
+  const toolName = fcall.name || fcall.toolName;
+  const found = findToolByName(toolName);
   let result;
   const args = fcall.arguments ? JSON.parse(fcall.arguments) : fcall.input;
 
-  if (actionClass.follow_on_generate) {
-    const toolCallIndex = run.context.interactions.findIndex(
-      (i) =>
-        i.tool_call_id === fcall_id ||
-        (Array.isArray(i.content) &&
-          i.content.some((c) => c.toolCallId === fcall_id))
-    );
-    const follow_on_gen = run.context.interactions.find(
-      (i, ix) => i.role === "assistant" && ix > toolCallIndex
-    );
-    result = await actionClass.execute(args, req, follow_on_gen.content);
+  if (found?.tool?.process) {
+    result = await found.tool.process(args);
+  } else if (found?.skill?.execute) {
+    if (found.skill.follow_on_generate) {
+      const toolCallIndex = run.context.interactions.findIndex(
+        (i) =>
+          i.tool_call_id === fcall_id ||
+          (Array.isArray(i.content) &&
+            i.content.some((c) => c.toolCallId === fcall_id))
+      );
+      const follow_on_gen = run.context.interactions.find(
+        (i, ix) => i.role === "assistant" && ix > toolCallIndex
+      );
+      result = await found.skill.execute(args, req, follow_on_gen.content);
+    } else {
+      result = await found.skill.execute(args, req);
+    }
   } else {
-    result = await actionClass.execute(args, req);
+    result = { error: `Tool ${toolName} not found or has no process/execute method` };
   }
   await addToContext(run, { implemented_fcall_ids: [fcall_id] });
   return { json: { success: "ok", fcall_id, ...(result || {}) } };
@@ -500,20 +557,40 @@ const interactLegacy = async (table_id, viewname, config, body, { req }) => {
           },
         ],
       });
-  else
+  else if (typeof answer === "object" && answer.tool_calls) {
+    const toolInteractions = await Promise.all(
+      answer.tool_calls.map(async (tc) => {
+        const fname = tc.function?.name || tc.toolName;
+        const found = findToolByName(fname);
+        if (found?.tool?.process) {
+          const args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : tc.input;
+          const result = await found.tool.process(args);
+          const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+          return {
+            role: "tool",
+            tool_call_id: tc.id || tc.toolCallId,
+            name: fname,
+            content: resultStr,
+          };
+        } else {
+          return {
+            role: "tool",
+            tool_call_id: tc.id || tc.toolCallId,
+            name: fname,
+            content: "Action suggested to user.",
+          };
+        }
+      })
+    );
     await addToContext(run, {
-      interactions:
-        typeof answer === "object" && answer.tool_calls
-          ? [
-              { role: "assistant", tool_calls: answer.tool_calls },
-              ...answer.tool_calls.map((tc) => ({
-                role: "tool",
-                tool_call_id: tc.id || tc.toolCallId,
-                name: tc.function?.name || tc.toolName,
-                content: "Action suggested to user.",
-              })),
-            ]
-          : [{ role: "assistant", content: answer }],
+      interactions: [
+        { role: "assistant", tool_calls: answer.tool_calls },
+        ...toolInteractions,
+      ],
+    });
+  } else
+    await addToContext(run, {
+      interactions: [{ role: "assistant", content: answer }],
     });
   if (typeof answer === "object" && answer.tool_calls) {
     const actions = [];
@@ -563,9 +640,25 @@ const interactLegacy = async (table_id, viewname, config, body, { req }) => {
 
         actions.push(markup);
       } else {
-        const markup = await renderToolcall(tool_call, viewname, false, run);
-
-        actions.push(markup);
+        const fname = tool_call.function?.name || tool_call.toolName;
+        const found = findToolByName(fname);
+        
+        if (found?.tool?.process) {
+          const finalAnswer = await getState().functions.llm_generate.run(
+            "Generate a response based on the tool results above.",
+            {
+              chat: run.context.interactions,
+            }
+          );
+          await addToContext(run, {
+            interactions: [{ role: "assistant", content: finalAnswer }],
+          });
+          const responseObj = { json: { success: "ok", response: md.render(finalAnswer), run_id: run.id } };
+          return responseObj;
+        } else {
+          const markup = await renderToolcall(tool_call, viewname, false, run);
+          actions.push(markup);
+        }
       }
     }
     return { json: { success: "ok", actions, run_id: run.id } };
@@ -652,16 +745,19 @@ const execute_user_action = async (table_id, viewname, config, body, extra) => {
 
 const getFollowOnGeneration = async (tool_call) => {
   const fname = tool_call.function?.name || tool_call.toolName;
-  const actionClass = classesWithSkills().find(
-    (ac) => ac.function_name === fname
-  );
+  const found = findToolByName(fname);
+  if (!found) return null;
+  
   const args = tool_call.function?.arguments
     ? JSON.parse(tool_call.function?.arguments)
     : tool_call.input;
 
-  if (actionClass.follow_on_generate) {
-    return await actionClass.follow_on_generate(args);
-  } else return null;
+  if (found.skill?.follow_on_generate) {
+    return await found.skill.follow_on_generate(args);
+  } else if (found.tool?.follow_on_generate) {
+    return await found.tool.follow_on_generate(args);
+  }
+  return null;
 };
 
 const renderToolcall = async (
@@ -672,22 +768,39 @@ const renderToolcall = async (
   follow_on_answer
 ) => {
   const fname = tool_call.function?.name || tool_call.toolName;
-  const actionClass = classesWithSkills().find(
-    (ac) => ac.function_name === fname
-  );
+  const found = findToolByName(fname);
+  if (!found) {
+    return div({ class: "alert alert-warning" }, `Tool ${fname} not found`);
+  }
   const args = tool_call.function?.arguments
     ? JSON.parse(tool_call.function.arguments)
     : tool_call.input;
 
-  const inner_markup = await actionClass.render_html(args, follow_on_answer);
-  return wrapAction(
-    inner_markup,
-    viewname,
-    tool_call,
-    actionClass,
-    implemented,
-    run
-  );
+  const actionClass = found.skill;
+  
+  if (actionClass.render_html) {
+    const inner_markup = await actionClass.render_html(args, follow_on_answer);
+    return wrapAction(
+      inner_markup,
+      viewname,
+      tool_call,
+      actionClass,
+      implemented,
+      run
+    );
+  } else if (found.tool?.process) {
+    const result = await found.tool.process(args);
+    const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    return div(
+      { class: "alert alert-info" },
+      pre({ style: "white-space: pre-wrap; word-break: break-all;" }, resultStr)
+    );
+  } else {
+    return div(
+      { class: "alert alert-warning" },
+      `Tool ${fname} has no render_html or process method`
+    );
+  }
 };
 
 const wrapAction = (
